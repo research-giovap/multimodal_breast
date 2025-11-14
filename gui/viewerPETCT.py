@@ -1,4 +1,4 @@
-import preprocessing as preprocessing
+from preprocessing import preprocessing
 import sys
 import numpy as np
 import matplotlib.pyplot as plt
@@ -108,7 +108,7 @@ class PETCTViewer(QMainWindow):
         
         if self.sitk_ct is not None:
             self.pet_resampled, self.pet_array = preprocessing.align_pet_to_ct(
-                self.sitk_pet, self.sitk_ct
+                self.sitk_pet, self.sitk_ct, interpolation_method='linear'
             )
         else:
             self.pet_resampled = self.sitk_pet
