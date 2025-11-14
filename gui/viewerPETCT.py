@@ -204,3 +204,5 @@ class PETCTViewer(QMainWindow):
             f"PET: [{self.pet_min:.2f}, {self.pet_max:.2f}]"
         )
 
+
+print('Ho aperto il file!!')

@@ -12,3 +12,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
+    # Ho aperto il file su visual studio code
