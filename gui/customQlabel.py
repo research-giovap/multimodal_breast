@@ -1,75 +1,127 @@
-
-# In your imports, make sure you have QSizePolicy
-from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QLabel, QVBoxLayout, QWidget,
-    QPushButton, QFileDialog, QSlider, QHBoxLayout, QSizePolicy
-)
-from PyQt5.QtCore import Qt
-from PyQt5.QtGui import QPixmap, QImage
+from PyQt5.QtWidgets import QLabel, QSizePolicy
+from PyQt5.QtCore import Qt, QRectF
+from PyQt5.QtGui import QPixmap, QImage, QPainter, QColor
 
 class AspectLabel(QLabel):
     """
-    A QLabel that maintains a fixed aspect ratio when resized.
-    Corrected to handle initial display and shrinking.
+    A smart QLabel that handles aspect-ratio preserved scaling, 
+    zooming, panning, and coordinate mapping.
     """
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._pixmap = QPixmap()
+        self._pixmap = None
         self.aspect_ratio = 1.0
         
-        # --- FIX #1: Use a more forceful size policy ---
-        # 'Ignored' tells the layout to completely control the widget's size,
-        # overriding any minimum size hints and allowing it to shrink.
+        # Transformation state
+        self.zoom = 1.0
+        self.pan_x = 0.0
+        self.pan_y = 0.0
+
+        # UI Settings
         self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
         self.setAlignment(Qt.AlignCenter)
+        self.setMouseTracking(True)
 
     def set_qimage(self, qimage: QImage):
-        """
-        Sets the QImage, calculates aspect ratio, and immediately updates the display.
-        """
+        """Sets the QImage and updates the internal pixmap."""
         if qimage.isNull():
-            self._pixmap = QPixmap()
-            self.aspect_ratio = 1.0
+            self._pixmap = None
         else:
             self._pixmap = QPixmap.fromImage(qimage)
-            # Handle potential division by zero for invalid images
-            if self._pixmap.height() == 0:
-                self.aspect_ratio = 1.0
-            else:
+            if self._pixmap.height() > 0:
                 self.aspect_ratio = self._pixmap.width() / self._pixmap.height()
+        self.update() # Trigger a repaint
 
-        # Tell the layout that our size hint may have changed due to the new aspect ratio
-        self.updateGeometry()
+    def apply_zoom_pan(self, zoom_delta, pan_delta_x, pan_delta_y):
+        """Updates transform based on user input."""
+        # Update Zoom
+        self.zoom = max(0.1, min(self.zoom + zoom_delta, 50.0))
         
-        # --- FIX #2: Immediately scale and display the image ---
-        # This ensures the image appears on the first load without
-        # needing a manual window resize. We call the same logic that resizeEvent uses.
-        self._rescale_and_set_pixmap()
+        # Update Pan
+        self.pan_x += pan_delta_x
+        self.pan_y += pan_delta_y
+        
+        self.update()
 
-    def _rescale_and_set_pixmap(self):
-        """Internal helper to scale the stored pixmap to the current widget size."""
-        if self._pixmap.isNull():
-            super().setPixmap(QPixmap()) # Clear the pixmap
+    def reset_view(self):
+        """Resets zoom and pan to default."""
+        self.zoom = 1.0
+        self.pan_x = 0.0
+        self.pan_y = 0.0
+        self.update()
+
+    def get_image_coords(self, widget_pos):
+        """
+        Maps a widget coordinate (e.g., mouse click) to image pixel coordinates.
+        Returns (x, y) if inside image, else None.
+        """
+        if self._pixmap is None:
+            return None
+
+        # Re-calculate the drawing rect (logic must match paintEvent)
+        w, h = self.width(), self.height()
+        if w == 0 or h == 0: return None
+        
+        # 1. Base scale to fit window
+        scale_w = w / self._pixmap.width()
+        scale_h = h / self._pixmap.height()
+        base_scale = min(scale_w, scale_h)
+
+        # 2. Apply total scale (Base * Zoom)
+        final_scale = base_scale * self.zoom
+
+        # 3. Calculate centered position
+        drawn_w = self._pixmap.width() * final_scale
+        drawn_h = self._pixmap.height() * final_scale
+        
+        # 4. Apply Pan offsets
+        x_offset = (w - drawn_w) / 2 + self.pan_x
+        y_offset = (h - drawn_h) / 2 + self.pan_y
+
+        # 5. Inverse map: (Widget - Offset) / Scale
+        img_x = (widget_pos.x() - x_offset) / final_scale
+        img_y = (widget_pos.y() - y_offset) / final_scale
+
+        # Check bounds
+        if 0 <= img_x < self._pixmap.width() and 0 <= img_y < self._pixmap.height():
+            return int(img_x), int(img_y)
+        return None
+
+    def paintEvent(self, event):
+        """Custom paint to handle zoom/pan and BLACK background."""
+        painter = QPainter(self)
+        
+        # --- FIX: Fill background with black first ---
+        painter.fillRect(self.rect(), Qt.black)
+
+        if self._pixmap is None:
+            painter.end()
             return
-            
-        scaled_pixmap = self._pixmap.scaled(
-            self.size(),
-            Qt.KeepAspectRatio,
-            Qt.SmoothTransformation
-        )
-        super().setPixmap(scaled_pixmap)
 
-    def resizeEvent(self, event):
-        """On resize, simply call the rescale helper."""
-        self._rescale_and_set_pixmap()
+        painter.setRenderHint(QPainter.SmoothPixmapTransform)
+        painter.setRenderHint(QPainter.Antialiasing)
 
-    def hasHeightForWidth(self):
-        """Tells the layout manager we have a preferred height based on our width."""
-        return not self._pixmap.isNull()
-
-    def heightForWidth(self, width):
-        """Calculates the preferred height for a given width to maintain aspect ratio."""
-        if self._pixmap.isNull():
-            return self.height()
+        w, h = self.width(), self.height()
         
-        return int(width / self.aspect_ratio)
+        # 1. Calculate Base Scale (Fit to Window)
+        scale_w = w / self._pixmap.width()
+        scale_h = h / self._pixmap.height()
+        base_scale = min(scale_w, scale_h)
+
+        # 2. Apply Zoom
+        final_scale = base_scale * self.zoom
+
+        # 3. Calculate target dimensions
+        target_w = self._pixmap.width() * final_scale
+        target_h = self._pixmap.height() * final_scale
+
+        # 4. Calculate positions (Center + Pan)
+        x = (w - target_w) / 2 + self.pan_x
+        y = (h - target_h) / 2 + self.pan_y
+
+        # Draw
+        target_rect = QRectF(x, y, target_w, target_h)
+        source_rect = QRectF(0, 0, self._pixmap.width(), self._pixmap.height())
+        
+        painter.drawPixmap(target_rect, self._pixmap, source_rect)
+        painter.end()

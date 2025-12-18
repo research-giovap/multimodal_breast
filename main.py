@@ -6,7 +6,7 @@ from gui.viewerPETCT import PETCTViewer
 
 def main():
     app = QApplication(sys.argv)
-    viewer = PETCTViewer(initial_size=(512, 512))
+    viewer = PETCTViewer(initial_size=(1400, 900))
     viewer.show()
     sys.exit(app.exec_()) 
 
