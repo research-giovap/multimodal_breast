@@ -168,7 +168,29 @@ def get_sitk_interpolator(method_name: str) -> int:
     else:
         print(f"Warning: Unknown interpolator '{method_name}'. Defaulting to linear.")
         return sitk.sitkLinear
-    
+
+def physical_resize(np_image: np.ndarray, pixel_spacing: tuple, interpolation_method: str = 'nearest'):
+    """Resize a 3D NumPy array to a new shape using specified interpolation.
+    """
+    print(f"start resizing volume...")
+    if interpolation_method =='nearest':
+        order = 0   # Nearest neighbor
+    elif interpolation_method =='linear':
+        order = 1   # Trilinear
+    elif interpolation_method =='bspline':
+        order = 3   # Cubic B-spline
+    else:
+        print(f"Warning: Unknown interpolation method '{interpolation_method}'. Defaulting to nearest neighbor.")
+        order = 0   # Nearest neighbor
+    new_shape = (np_image.shape[0], np_image.shape[1]*pixel_spacing[1], np_image.shape[2]*pixel_spacing[2])
+    resized_volume = resize(
+        np_image,
+        output_shape=new_shape,
+        order=order,                  # Use trilinear interpolation
+        preserve_range=True,      # Crucial: Keep the original data range!
+        anti_aliasing=True        # Recommended for downsampling to prevent artifacts
+        )
+    return resized_volume
 def resample(sitk_image, np_image, new_spacing, interpolation_method='nearest', return_sitk_obj=False):
     print(f"start resampling...")
     if interpolation_method =='nearest':
@@ -226,8 +248,8 @@ def align_pet_to_ct(pet_image: sitk.Image, ct_image: sitk.Image, interpolation_m
 
     # --- (Your existing pre-alignment sanity checks code) ---
     print("--- Before Alignment ---")
-    print(f"CT Size: {ct_image.GetSize()}, Origin: {ct_image.GetOrigin()}, Direction: {ct_image.GetDirection()}")
-    print(f"PET Size: {pet_image.GetSize()}, Origin: {pet_image.GetOrigin()}, Direction: {pet_image.GetDirection()}")
+    print(f"CT Size: {ct_image.GetSize()}, Origin: {ct_image.GetOrigin()}, Direction: {ct_image.GetDirection()}, Spacing: {ct_image.GetSpacing()}")
+    print(f"PET Size: {pet_image.GetSize()}, Origin: {pet_image.GetOrigin()}, Direction: {pet_image.GetDirection()}, Spacing: {pet_image.GetSpacing()}")
     # ... (rest of your verification prints and casting to Float64)
 
     ct_image = sitk.Cast(ct_image, sitk.sitkFloat64)
@@ -259,7 +281,7 @@ def align_pet_to_ct(pet_image: sitk.Image, ct_image: sitk.Image, interpolation_m
         resampled_pet_array = resampled_pet_array[::-1, :, :]
 
     print("\n--- After Alignment ---")
-    print(f"Aligned PET Size: {resampled_pet_image.GetSize()}, Origin: {resampled_pet_image.GetOrigin()}, Direction: {resampled_pet_image.GetDirection()}")
+    print(f"Aligned PET Size: {resampled_pet_image.GetSize()}, Origin: {resampled_pet_image.GetOrigin()}, Direction: {resampled_pet_image.GetDirection()}, Spacing: {resampled_pet_image.GetSpacing()}")
 
     return resampled_pet_image, resampled_pet_array
 
@@ -279,6 +301,77 @@ def transform_to_sitk_image(np_image: np.ndarray, reference_sitk: sitk.Image) ->
     sitk_image.SetSpacing(reference_sitk.GetSpacing())
     sitk_image.SetDirection(reference_sitk.GetDirection())
     return sitk_image
+
+
+def _permute_and_fix(sitk_image: sitk.Image, perm):
+    """Permute axes of a SimpleITK image and fix spacing/direction/origin.
+
+    Args:
+        sitk_image: Input 3D SimpleITK image.
+        perm: A length-3 list/tuple mapping new axis -> old axis (same semantics as
+              SimpleITK.PermuteAxes).
+
+    Returns:
+        permuted SimpleITK image with corrected spacing, direction and same origin.
+    """
+    if len(perm) != 3:
+        raise ValueError("perm must be length 3 for a 3D image")
+
+    # Perform the axis permutation
+    permuted = sitk.PermuteAxes(sitk_image, perm)
+
+    # Original metadata
+    orig_spacing = sitk_image.GetSpacing()  # (sx, sy, sz)
+    orig_direction = np.array(sitk_image.GetDirection()).reshape((3, 3))
+    orig_origin = sitk_image.GetOrigin()
+
+    # New spacing: pick components according to perm
+    new_spacing = tuple(orig_spacing[p] for p in perm)
+
+    # New direction: columns of the direction matrix are permuted
+    new_direction_matrix = orig_direction[:, list(perm)]
+    new_direction = tuple(new_direction_matrix.flatten())
+
+    permuted.SetSpacing(new_spacing)
+    permuted.SetDirection(new_direction)
+    permuted.SetOrigin(orig_origin)
+
+    return permuted
+
+
+def extract_orthogonal_views(sitk_image: sitk.Image):
+    """Return axial, coronal and sagittal views as both SimpleITK images and numpy arrays.
+
+    The function permutes axes so that slicing along the last index produces the desired
+    anatomical plane. It ensures the resulting images have correct in-plane spacing and
+    direction cosines so that visualisation will not be distorted.
+
+    Returns a dict with keys:
+      - 'axial': {'sitk': sitk_image, 'np': array, 'spacing': (sx, sy)}
+      - 'coronal': {'sitk': coronal_sitk, 'np': array, 'spacing': (sx, sz)}
+      - 'sagittal': {'sitk': sagittal_sitk, 'np': array, 'spacing': (sy, sz)}
+    """
+    # Axial (original) -> in-plane axes are X (left-right) and Y (anterior-posterior)
+    axial_sitk = sitk_image
+    sx, sy, sz = sitk_image.GetSpacing()
+    axial_np = sitk.GetArrayFromImage(axial_sitk)  # shape (z, y, x)
+
+    # Coronal: want in-plane axes X (left-right) and Z (superior-inferior), slice through Y.
+    # Permutation mapping new axes -> old axes: [0,2,1] -> (x, z, y)
+    coronal_sitk = _permute_and_fix(sitk_image, (0, 2, 1))
+    coronal_np = sitk.GetArrayFromImage(coronal_sitk)  # shape (y, z, x) -> slices along last axis -> original Y
+
+    # Sagittal: want in-plane axes Y (anterior-posterior) and Z (superior-inferior), slice through X.
+    # Permutation mapping new axes -> old axes: [1,2,0] -> (y, z, x)
+    sagittal_sitk = _permute_and_fix(sitk_image, (1, 2, 0))
+    sagittal_np = sitk.GetArrayFromImage(sagittal_sitk)  # shape (x, z, y) -> slices along last axis -> original X
+
+    views = {
+        'axial': {'sitk': axial_sitk, 'np': axial_np, 'spacing': (sx, sy)},
+        'coronal': {'sitk': coronal_sitk, 'np': coronal_np, 'spacing': (sx, sz)},
+        'sagittal': {'sitk': sagittal_sitk, 'np': sagittal_np, 'spacing': (sy, sz)},
+    }
+    return views
 
 
 def bbox_largest_component(image_array: np.ndarray, mask_array: np.ndarray, display=False):
@@ -999,6 +1092,315 @@ def sample_patches_25d_initialization(vol1, vol2, mask, patch_size=(32, 32),
             np.array(patches_scribble_mask))
 
 
+import numpy as np
+
+def sample_patches_25d_breast(vol1, vol2, mask, view='axial', patch_size=(32, 32), 
+                              min_coverage=0.3, contra_share=0.85):
+    """
+    Final Optimized Sampler with View-Dependent Ratios.
+    
+    Ratios (Automatic based on view):
+    - Axial:    50% Positive / 50% Negative (1.0 ratio)
+    - Coronal:  70% Positive / 30% Negative (~0.43 ratio)
+    - Sagittal: 70% Positive / 30% Negative (~0.43 ratio)
+    
+    Args:
+        contra_share (float): Of the generated negatives, what % should be Contralateral?
+                              (Default 0.85 -> 85% Contralateral, 15% Random Background)
+    """
+    # 1. Float32 Enforcement (Crucial for Memory)
+    if vol1.dtype == np.float64: vol1 = vol1.astype(np.float32)
+    if vol2.dtype == np.float64: vol2 = vol2.astype(np.float32)
+
+    Z, H, W = vol1.shape
+    ph, pw = patch_size
+    ph_half, pw_half = ph // 2, pw // 2
+
+    # Helper: Extract 3-slice triplet
+    def get_triplet(vol, z, y, x):
+        triplet = []
+        for dz in [-1, 0, 1]:
+            zz = np.clip(z + dz, 0, Z - 1)
+            triplet.append(vol[zz, y:y + ph, x:x + pw])
+        return np.stack(triplet, axis=0)
+
+    # --- 2. Determine Ratios based on View ---
+    view_lower = view.lower()
+    
+    if view_lower == 'axial':
+        # 50/50 Split -> 1 Negative for every 1 Positive
+        neg_to_pos_ratio = 1.0 
+    else: 
+        # 70% Pos / 30% Neg -> 0.428 Negatives for every 1 Positive
+        # Math: 30 / 70 = 0.42857...
+        neg_to_pos_ratio = 30 / 70
+
+    # --- 3. Get POSITIVE Samples (Centroid per slice) ---
+    final_positives = []
+    
+    # Identify slices with mask
+    z_indices = np.where(np.any(mask, axis=(1, 2)))[0]
+    if len(z_indices) == 0: raise ValueError(f"No slices with mask in {view} view!")
+
+    slice_mask_sums = np.sum(mask, axis=(1, 2))
+
+    for z in z_indices:
+        ys, xs = np.where(mask[z] > 0)
+        if len(ys) == 0: continue
+        
+        # Centroid
+        cy, cx = int(np.mean(ys)), int(np.mean(xs))
+        y = np.clip(cy - ph_half, 0, H - ph)
+        x = np.clip(cx - pw_half, 0, W - pw)
+        
+        final_positives.append((z, y, x))
+
+    N_pos = len(final_positives)
+    if N_pos == 0: raise ValueError("No positive patches found.")
+
+    # --- 4. Calculate Negative Targets ---
+    total_negatives_needed = int(np.ceil(N_pos * neg_to_pos_ratio))
+    
+    # Split Negatives: Mostly Contralateral (if available), rest Threshold
+    target_contra = int(np.ceil(total_negatives_needed * contra_share))
+    target_thresh = total_negatives_needed - target_contra
+
+    candidate_negatives_contra = []
+
+    # --- 5. Generate Contralateral (With Promotion) ---
+    # Only applicable for Axial/Coronal usually, but logic holds if symmetric
+    if view_lower in ['axial', 'coronal']:
+        current_positives = list(final_positives)
+        
+        for (z, y, x) in current_positives:
+            # Flip X
+            center_x = x + pw_half
+            flipped_center_x = W - 1 - center_x
+            x_contra = int(np.clip(flipped_center_x - pw_half, 0, W - pw))
+            
+            # Check overlap
+            patch_mask_sum = np.sum(mask[z, y:y+ph, x_contra:x_contra+pw])
+            slice_total = slice_mask_sums[z]
+            thresh = min_coverage * slice_total if slice_total > 0 else 0
+            
+            if patch_mask_sum == 0:
+                candidate_negatives_contra.append((z, y, x_contra))
+            elif patch_mask_sum >= thresh:
+                # Promote to Positive (if not already there)
+                if (z, y, x_contra) not in final_positives:
+                    final_positives.append((z, y, x_contra))
+
+    # Shuffle and Select Contralateral
+    np.random.shuffle(candidate_negatives_contra)
+    
+    if len(candidate_negatives_contra) < target_contra:
+        selected_contra = candidate_negatives_contra
+        missing = target_contra - len(candidate_negatives_contra)
+        target_thresh += missing # Fill gap with random background
+    else:
+        selected_contra = candidate_negatives_contra[:target_contra]
+
+    # --- 6. Generate Threshold Negatives (Rejection Sampling) ---
+    selected_thresh = []
+    
+    if target_thresh > 0:
+        mask_bool = mask > 0
+        thr = vol2[mask_bool].min() if np.any(mask_bool) else vol2.mean()
+        
+        # Distribution: 70% near tumor z-slices, 10% above, 20% below
+        n70 = int(0.7 * target_thresh)
+        n10 = int(0.1 * target_thresh)
+        n20 = target_thresh - n70 - n10
+        
+        zmin, zmax = z_indices[0], z_indices[-1]
+
+        def get_random_negatives(z_start, z_end, count):
+            if count <= 0 or z_end <= z_start: return []
+            found = []
+            attempts = 0
+            max_attempts = count * 200
+            
+            while len(found) < count and attempts < max_attempts:
+                attempts += 1
+                rz = np.random.randint(z_start, z_end)
+                ry = np.random.randint(0, H - ph)
+                rx = np.random.randint(0, W - pw)
+                
+                if mask[rz, ry+ph_half, rx+pw_half] == 0: # Center Check
+                    if vol2[rz, ry+ph_half, rx+pw_half] >= thr: # Intensity Check
+                        if np.sum(mask[rz, ry:ry+ph, rx:rx+pw]) == 0: # Full Patch Check
+                            found.append((rz, ry, rx))
+            return found
+
+        selected_thresh.extend(get_random_negatives(max(0, zmin-1), min(Z, zmax+2), n70))
+        selected_thresh.extend(get_random_negatives(0, zmin, n10))
+        selected_thresh.extend(get_random_negatives(zmax, Z, n20))
+
+    # --- 7. Final Extraction ---
+    # Combine lists with labels: 1=Pos, 0=Neg
+    all_coords = []
+    for c in final_positives: all_coords.append(c + (1,))
+    for c in selected_contra: all_coords.append(c + (0,))
+    for c in selected_thresh: all_coords.append(c + (0,))
+    
+    total_patches = len(all_coords)
+    
+    # Allocating memory (Small size: ~100-200 patches)
+    out_vol1 = np.zeros((total_patches, 3, ph, pw), dtype=np.float32)
+    out_vol2 = np.zeros((total_patches, 3, ph, pw), dtype=np.float32)
+    out_mask = np.zeros((total_patches, ph, pw), dtype=mask.dtype)
+
+    for i, (z, y, x, is_pos) in enumerate(all_coords):
+        out_vol1[i] = get_triplet(vol1, z, y, x)
+        out_vol2[i] = get_triplet(vol2, z, y, x)
+        if is_pos:
+            out_mask[i] = mask[z, y:y+ph, x:x+pw]
+
+    return out_vol1, out_vol2, out_mask
+
+import numpy as np
+
+def sample_patches_25d_prostate(vol1, vol2, mask, view='axial', patch_size=(32, 32), min_coverage=0.3):
+    """
+    Prostate-Specific Sampling (2.5D) with Promotion.
+    
+    Logic:
+    1. POSITIVES: 1 Centroid patch per slice containing mask.
+    2. NEGATIVES: Threshold-based random background sampling only.
+       - Promotion: If a 'background' candidate overlaps mask >= 30%, it becomes POSITIVE.
+    3. RATIO: Fixed at 70% Positive / 30% Negative.
+    """
+    # 1. Float32 Enforcement
+    if vol1.dtype == np.float64: vol1 = vol1.astype(np.float32)
+    if vol2.dtype == np.float64: vol2 = vol2.astype(np.float32)
+
+    Z, H, W = vol1.shape
+    ph, pw = patch_size
+    ph_half, pw_half = ph // 2, pw // 2
+
+    # Helper: Extract 3-slice triplet
+    def get_triplet(vol, z, y, x):
+        triplet = []
+        for dz in [-1, 0, 1]:
+            zz = np.clip(z + dz, 0, Z - 1)
+            triplet.append(vol[zz, y:y + ph, x:x + pw])
+        return np.stack(triplet, axis=0)
+
+    # --- 2. Get Initial POSITIVE Samples (Centroid per slice) ---
+    final_positives = []
+    
+    # Pre-calculate slice sums for promotion check
+    slice_mask_sums = np.sum(mask, axis=(1, 2))
+    z_indices = np.where(slice_mask_sums > 0)[0]
+    
+    if len(z_indices) == 0: 
+        raise ValueError(f"No positive mask found in {view} view!")
+
+    for z in z_indices:
+        ys, xs = np.where(mask[z] > 0)
+        if len(ys) == 0: continue
+        
+        # Centroid
+        cy, cx = int(np.mean(ys)), int(np.mean(xs))
+        y = np.clip(cy - ph_half, 0, H - ph)
+        x = np.clip(cx - pw_half, 0, W - pw)
+        
+        final_positives.append((z, y, x))
+
+    # Create a set for fast duplicate checking during promotion
+    existing_pos_set = set(final_positives)
+
+    N_pos = len(final_positives)
+    if N_pos == 0: raise ValueError("No positive patches found.")
+
+    # --- 3. Calculate Negative Targets (70/30 Fixed Ratio) ---
+    # Ratio: 30 negatives for every 70 positives
+    neg_to_pos_ratio = 30 / 70
+    target_thresh = int(np.ceil(N_pos * neg_to_pos_ratio))
+
+    # --- 4. Generate Threshold Negatives (With Promotion) ---
+    selected_thresh = []
+    
+    if target_thresh > 0:
+        mask_bool = mask > 0
+        thr = vol2[mask_bool].min() if np.any(mask_bool) else vol2.mean()
+        
+        # Spatial Splits
+        n70 = int(0.7 * target_thresh)
+        n10 = int(0.1 * target_thresh)
+        n20 = target_thresh - n70 - n10
+        
+        zmin, zmax = z_indices[0], z_indices[-1]
+
+        def get_candidates_with_promotion(z_start, z_end, count):
+            if count <= 0 or z_end <= z_start: return []
+            
+            found_negatives = []
+            attempts = 0
+            max_attempts = count * 200 # Safety break
+            
+            while len(found_negatives) < count and attempts < max_attempts:
+                attempts += 1
+                rz = np.random.randint(z_start, z_end)
+                ry = np.random.randint(0, H - ph)
+                rx = np.random.randint(0, W - pw)
+                
+                # 1. Center Check (Must look like background initially)
+                if mask[rz, ry+ph_half, rx+pw_half] == 0:
+                    
+                    # 2. Intensity Check
+                    if vol2[rz, ry+ph_half, rx+pw_half] >= thr:
+                        
+                        # 3. Promotion Logic
+                        patch_mask_sum = np.sum(mask[rz, ry:ry+ph, rx:rx+pw])
+                        
+                        if patch_mask_sum == 0:
+                            # Strict Negative (No overlap)
+                            found_negatives.append((rz, ry, rx))
+                        else:
+                            # Check for Promotion
+                            slice_total = slice_mask_sums[rz]
+                            coverage_thresh = min_coverage * slice_total if slice_total > 0 else 0
+                            
+                            if patch_mask_sum >= coverage_thresh:
+                                # Promote to Positive
+                                if (rz, ry, rx) not in existing_pos_set:
+                                    final_positives.append((rz, ry, rx))
+                                    existing_pos_set.add((rz, ry, rx))
+                            
+                            # If 0 < sum < coverage_thresh, we discard (Ambiguous)
+            
+            return found_negatives
+
+        # Gather samples
+        selected_thresh.extend(get_candidates_with_promotion(max(0, zmin-1), min(Z, zmax+2), n70))
+        selected_thresh.extend(get_candidates_with_promotion(0, zmin, n10))
+        selected_thresh.extend(get_candidates_with_promotion(zmax, Z, n20))
+
+    # --- 5. Final Extraction ---
+    # Combine coordinates: Positives (Label 1) and Negatives (Label 0)
+    all_coords = []
+    for c in final_positives: all_coords.append(c + (1,))
+    for c in selected_thresh: all_coords.append(c + (0,))
+    
+    total_patches = len(all_coords)
+    
+    # Pre-allocate memory (Float32)
+    out_vol1 = np.zeros((total_patches, 3, ph, pw), dtype=np.float32)
+    out_vol2 = np.zeros((total_patches, 3, ph, pw), dtype=np.float32)
+    out_mask = np.zeros((total_patches, ph, pw), dtype=mask.dtype)
+
+    for i, (z, y, x, is_pos) in enumerate(all_coords):
+        out_vol1[i] = get_triplet(vol1, z, y, x)
+        out_vol2[i] = get_triplet(vol2, z, y, x)
+        
+        if is_pos:
+            out_mask[i] = mask[z, y:y+ph, x:x+pw]
+        # Negatives remain 0
+
+    return out_vol1, out_vol2, out_mask
+
+
 def sample_patches_2d_propagation(vol1, vol2, mask, patch_size=(32, 32)):
     """
     Extracts 2.5D patches from two volumes based on a mask for segmentation tasks.
@@ -1117,6 +1519,16 @@ def save_multimodal_volumes_slices(multimodal_volume, target_mask, output_dir):
             os.path.join(output_dir, f"target_mask_slice_{i:03d}.npz"),
             mask=target_mask[i,:,:])
 
+def save_multimodal_volumes_slices_2(multimodal_volume, target_mask, view, organ, output_dir):
+    for i in range(multimodal_volume.shape[0]):
+        np.savez_compressed(
+            os.path.join(output_dir, f"multimodal_volume_{organ}_{view}_slice_{i:03d}.npz"),
+            volume=multimodal_volume[i,:,:,:]
+        )
+        np.savez_compressed(
+            os.path.join(output_dir, f"target_mask_{organ}_{view}_slice_{i:03d}.npz"),
+            mask=target_mask[i,:,:])
+
 def visualize_multimodal_triplets(
     multimodal_volume, target_masks, labels, weights,
     save_dir="triplet_visualizations",
@@ -1171,6 +1583,53 @@ def visualize_multimodal_triplets(
 
         plt.tight_layout()
         save_path = os.path.join(save_dir, f"{prefix}_{i:03d}.png")
+        plt.savefig(save_path, bbox_inches='tight', dpi=150)
+        plt.close(fig)
+        print(f"Saved figure: {save_path}")
+
+
+def visualize_multimodal_triplets_2(
+    multimodal_volume, target_masks,
+    save_dir="triplet_visualizations_2",
+    cmap_ct='gray', cmap_pet='hot', cmap_mask='gray',
+    view = 'axial',
+    prefix="triplet2"
+):
+    """
+    Visualize multimodal volumes with shape (N,6,H,W):
+      channels 0-2: CT triplet
+      channels 3-5: PET triplet
+
+    Shows CT triplet (top row), PET triplet (bottom row) and target mask (top-right).
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    N = multimodal_volume.shape[0]
+
+    for i in range(N):
+        fig, axes = plt.subplots(2, 4, figsize=(20, 8))
+
+        # CT triplet (channels 0-2)
+        for j in range(3):
+            axes[0, j].imshow(multimodal_volume[i, j], cmap=cmap_ct)
+            axes[0, j].set_title(f"CT slice {j-1}")
+            axes[0, j].axis('off')
+
+        # PET triplet (channels 3-5)
+        for j in range(3):
+            axes[1, j].imshow(multimodal_volume[i, j+3], cmap=cmap_pet)
+            axes[1, j].set_title(f"PET slice {j-1}")
+            axes[1, j].axis('off')
+
+        # Target mask
+        axes[0, 3].imshow(target_masks[i], cmap=cmap_mask)
+        axes[0, 3].set_title("Target Mask")
+        axes[0, 3].axis('off')
+
+        # Empty subplot for layout alignment
+        axes[1, 3].axis('off')
+
+        plt.tight_layout()
+        save_path = os.path.join(save_dir, f"{view}_{prefix}_{i:03d}.png")
         plt.savefig(save_path, bbox_inches='tight', dpi=150)
         plt.close(fig)
         print(f"Saved figure: {save_path}")
