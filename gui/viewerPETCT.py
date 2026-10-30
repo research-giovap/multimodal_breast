@@ -9,12 +9,15 @@ import SimpleITK as sitk
 # --- Deep Learning Imports ---
 import torch
 from segmentation.model_defs import MODEL_REGISTRY, DEFAULT_MODEL_CONFIG
+from segmentation.inference import (load_method, ensemble_available, segment_slice, segment_volume,
+                                    VALIDATED_ENSEMBLE_LABEL)
 
 from PyQt5.QtWidgets import (
     QMainWindow, QLabel, QVBoxLayout, QWidget, QApplication,
     QPushButton, QFileDialog, QSlider, QHBoxLayout, 
     QSpinBox, QRadioButton, QButtonGroup, QGroupBox, 
-    QComboBox, QFrame, QMessageBox, QCheckBox, QSizePolicy, QProgressDialog
+    QComboBox, QFrame, QMessageBox, QCheckBox, QSizePolicy, QProgressDialog,
+    QGridLayout, QScrollArea
 )
 from PyQt5.QtCore import Qt, QSize, QTimer
 from PyQt5.QtGui import QImage, QPalette, QColor, QFont
@@ -45,6 +48,7 @@ class PETCTViewer(QMainWindow):
 
         # --- Deep Learning Model ---
         self.model = None
+        self._model_cache = {}          # loaded models, by combo entry
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model_folder = os.path.join("segmentation", "models")
         
@@ -121,7 +125,27 @@ class PETCTViewer(QMainWindow):
             QCheckBox { color: #ddd; spacing: 5px; }
         """)
         
-        menu_layout = QVBoxLayout(self.left_panel)
+        # Scrollable content, so that the column fits also on small screens
+        left_outer = QVBoxLayout(self.left_panel)
+        left_outer.setContentsMargins(0, 0, 0, 0)
+        left_scroll = QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setFrameShape(QFrame.NoFrame)
+        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        left_scroll.setStyleSheet("""
+            QScrollArea { border: none; background-color: #333333; }
+            QScrollBar:vertical { background: #333333; width: 8px; margin: 0; }
+            QScrollBar::handle:vertical { background: #555; border-radius: 4px; min-height: 30px; }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+        """)
+        left_content = QWidget()
+        left_content.setObjectName("leftContent")
+        left_content.setStyleSheet("QWidget#leftContent { background-color: #333333; }")
+        left_content.setFixedWidth(self.left_panel.width() - 9)   # same width as before; room for the scroll bar
+        left_scroll.setWidget(left_content)
+        left_outer.addWidget(left_scroll)
+
+        menu_layout = QVBoxLayout(left_content)
         menu_layout.setContentsMargins(15, 20, 15, 20)
         menu_layout.setSpacing(15)
 
@@ -227,11 +251,44 @@ class PETCTViewer(QMainWindow):
         self.btn_clear.setStyleSheet("background-color: #c0392b;")
         self.btn_clear.clicked.connect(self.clear_mask)
 
+        self.btn_save = QPushButton("Save 3D Mask (NIfTI)")
+        self.btn_save.setStyleSheet("background-color: #27ae60; padding: 6px; margin-top: 5px;")
+        self.btn_save.clicked.connect(self.save_volumetric_mask)
+
         seg_layout.addWidget(self.btn_seg_2d)
         seg_layout.addWidget(self.btn_seg_3d)
+        seg_layout.addWidget(self.btn_save)
         seg_layout.addWidget(self.btn_clear)
         self.grp_seg.setLayout(seg_layout)
         menu_layout.addWidget(self.grp_seg)
+
+        # --- 4. QUANTITATIVE SUMMARY (volumetric segmentation) ---
+        self.grp_summary = QGroupBox("QUANTITATIVE SUMMARY")
+        self.grp_summary.setStyleSheet("QGroupBox { background-color: #3a3a3a; border: 1px solid #8e44ad; }")
+        summary_layout = QGridLayout()
+        summary_layout.setHorizontalSpacing(10)
+        summary_layout.setVerticalSpacing(6)
+        name_style = "color: #bbbbbb; font-weight: normal; font-size: 12px; margin-top: 0px; border: none; background: transparent;"
+        value_style = "color: white; font-weight: bold; font-size: 13px; margin-top: 0px; border: none; background: transparent;"
+        self.summary_values = {}
+        rows = [("mtv", "MTV"), ("slices", "Slices"), ("suvmax", "SUVmax"), ("suvmean", "SUVmean"), ("tlg", "TLG")]
+        for r, (key, name) in enumerate(rows):
+            lbl_name = QLabel(name)
+            lbl_name.setStyleSheet(name_style)
+            lbl_val = QLabel("—")
+            lbl_val.setStyleSheet(value_style)
+            lbl_val.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            lbl_val.setTextInteractionFlags(Qt.TextSelectableByMouse)   # values can be copied
+            summary_layout.addWidget(lbl_name, r, 0)
+            summary_layout.addWidget(lbl_val, r, 1)
+            self.summary_values[key] = lbl_val
+        self.lbl_summary_note = QLabel("Run a volumetric (3D) segmentation")
+        self.lbl_summary_note.setStyleSheet("color: #888888; font-weight: normal; font-style: italic; "
+                                            "font-size: 11px; margin-top: 4px; border: none; background: transparent;")
+        self.lbl_summary_note.setWordWrap(True)
+        summary_layout.addWidget(self.lbl_summary_note, len(rows), 0, 1, 2)
+        self.grp_summary.setLayout(summary_layout)
+        menu_layout.addWidget(self.grp_summary)
         menu_layout.addStretch()
 
         # ==========================================
@@ -294,214 +351,146 @@ class PETCTViewer(QMainWindow):
 
     # --- MODEL & DATA ---
     def refresh_model_list(self):
+        """First entry: the validated ensemble (default). Then the single models, for comparison."""
         self.combo_model.clear()
-        
-        # Ensure directory exists
-        if not os.path.exists(self.model_folder): 
+        if not os.path.exists(self.model_folder):
             os.makedirs(self.model_folder, exist_ok=True)
-            
-        # Get all .pth files
-        models = [os.path.basename(m) for m in glob.glob(os.path.join(self.model_folder, "*.pth"))]
-        
-        if models: 
-            self.combo_model.addItems(models)
+        singles = sorted(os.path.basename(m) for m in glob.glob(os.path.join(self.model_folder, "*.pth")))
+        if ensemble_available(self.model_folder):
+            self.combo_model.addItem(VALIDATED_ENSEMBLE_LABEL, "ensemble")
+        for m in singles:
+            self.combo_model.addItem(m, m)
+        if self.combo_model.count():
             self.combo_model.setEnabled(True)
-            
-            # --- START CHANGE: Set Default Model ---
-            default_model = "unet_2.pth"
-            
-            # check if the specific model exists in the list
-            index = self.combo_model.findText(default_model)
-            if index >= 0:
-                self.combo_model.setCurrentIndex(index)
-            # --- END CHANGE ---
-            
-        else: 
-            self.combo_model.addItem("No models found")
+            self.combo_model.setCurrentIndex(0)
+        else:
+            self.combo_model.addItem("No models found", None)
             self.combo_model.setEnabled(False)
 
     def load_selected_model(self):
-        model_name = self.combo_model.currentText()
-        if not model_name or "No models" in model_name: return False
-        
-        path = os.path.join(self.model_folder, model_name)
-        config = MODEL_REGISTRY.get(model_name, DEFAULT_MODEL_CONFIG)
-        
+        key = self.combo_model.currentData()
+        if not key:
+            return False
+        if key in self._model_cache:
+            self.model = self._model_cache[key]
+            return True
         try:
-            progress = self.create_progress("Loading Model", f"Loading {model_name}...")
-            self.model = config["class"](**config["params"])
-            self.model.load_state_dict(torch.load(path, map_location=self.device))
-            self.model.to(self.device).eval()
+            progress = self.create_progress("Loading Model", f"Loading {self.combo_model.currentText()}...")
+            self.model = load_method(self.model_folder, key, self.device)
+            self._model_cache[key] = self.model
             progress.close()
             return True
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to load model: {e}"); return False
-
-    # --- PROPAGATION LOGIC ---
-    def run_volumetric_propagation_centered(self, start_z_ai, start_seed_2d, progress_dlg, desc_prefix):
-        d, h, w = self.ai_ct_norm.shape
-        full_mask_ai = np.zeros((d, h, w), dtype=np.uint8)
-        
-        # --- START SLICE ---
-        input_vol, metadata = preprocessing.run_inference_direct_ai_space(
-            self.ai_ct_norm, self.ai_pet_norm, start_seed_2d, start_z_ai
-        )
-        
-        with torch.no_grad():
-            out = self.model(torch.from_numpy(input_vol).unsqueeze(0).float().to(self.device))
-            pred_mask = (torch.sigmoid(out) > 0.5).float().squeeze().cpu().numpy().astype(np.uint8)
-
-        if np.sum(pred_mask) == 0: return full_mask_ai
-
-        start_seg_result = preprocessing.paste_patch_into_slice(pred_mask, metadata)
-        full_mask_ai[start_z_ai] = start_seg_result
-        
-        # --- PROPAGATION ---
-        def propagate_direction(direction):
-            current_mask = start_seg_result
-            current_z = start_z_ai
-            
-            while True:
-                next_z = current_z + direction
-                if not (0 <= next_z < d): break
-                
-                progress_dlg.setLabelText(f"{desc_prefix}: Processing Slice {next_z}...")
-                QApplication.processEvents()
-
-                # Inference
-                input_vol, meta = preprocessing.run_inference_direct_ai_space(
-                    self.ai_ct_norm, self.ai_pet_norm, current_mask, next_z
-                )
-                
-                with torch.no_grad():
-                    out = self.model(torch.from_numpy(input_vol).unsqueeze(0).float().to(self.device))
-                    pred_next = (torch.sigmoid(out) > 0.5).float().squeeze().cpu().numpy().astype(np.uint8)
-
-                if np.sum(pred_next) == 0: break
-                
-                # 1. Reconstruct Raw Slice
-                next_full_slice_raw = preprocessing.paste_patch_into_slice(pred_next, meta)
-
-                # 2. ACTIVE FILTERING (Replaces the old check)
-                # Removes islands, keeps connected parts.
-                next_full_slice_clean = preprocessing.filter_disconnected_blobs(current_mask, next_full_slice_raw)
-                
-                # If everything was filtered out (tumor ended), stop.
-                if np.sum(next_full_slice_clean) == 0:
-                    break
-                
-                full_mask_ai[next_z] = next_full_slice_clean
-                current_z = next_z
-                current_mask = next_full_slice_clean
-
-        propagate_direction(1)
-        propagate_direction(-1)
-            
-        return full_mask_ai
+            if 'progress' in locals():
+                progress.close()
+            QMessageBox.critical(self, "Error", f"Failed to load model: {e}")
+            return False
 
     # --- BUTTON 1: SINGLE SLICE ---
     def run_segmentation_2d(self):
-        if self.ai_ct_norm is None: QMessageBox.warning(self, "Error", "Data not ready."); return
-        if self.seed_mask is None or not np.any(self.seed_mask): QMessageBox.warning(self, "Error", "Draw seed."); return
+        if self.ai_ct_norm is None: QMessageBox.warning(self, "Error", "Load CT and PET first."); return
+        if self.seed_mask is None or not np.any(self.seed_mask[self.current_slice]):
+            QMessageBox.warning(self, "Error", "Draw a prompt on the current slice."); return
         if not self.load_selected_model(): return
-
         try:
-            print("Running Single Slice Segmentation...")
-            input_vol, metadata = preprocessing.run_inference_on_preprocessed(
-                self.ai_ct_norm, self.ai_pet_norm, self.ai_scale_info,
-                self.seed_mask[self.current_slice], self.current_slice
-            )
-            
-            with torch.no_grad():
-                out = self.model(torch.from_numpy(input_vol).unsqueeze(0).float().to(self.device))
-                pred_single = (torch.sigmoid(out) > 0.5).float().squeeze().cpu().numpy().astype(np.uint8)
-                
-            final_single_vol = preprocessing.reconstruct_and_resample_back_optimized(
-                pred_single, metadata, self.sitk_ct
-            )
-            
-            self.segmentation_mask = final_single_vol.astype(np.uint8) # Update 2D mask only
+            pred, meta = segment_slice(self.model, self.device, self.ai_ct_norm, self.ai_pet_norm,
+                                       self.ai_scale_info, self.seed_mask[self.current_slice], self.current_slice)
+            self.segmentation_mask = preprocessing.reconstruct_and_resample_back_optimized(
+                pred, meta, self.sitk_ct).astype(np.uint8)
             self.update_slice()
-            QMessageBox.information(self, "Done", "2D Segmentation Complete (Cyan).")
-            
+            if not pred.any():
+                QMessageBox.information(self, "Result", "No lesion segmented on this slice.\n"
+                                        "The prompt may lie on non-tumoural uptake.")
         except Exception as e:
             import traceback; traceback.print_exc()
             QMessageBox.critical(self, "Error", f"{e}")
 
     # --- BUTTON 2: VOLUMETRIC ---
     def run_segmentation_3d(self):
-        if self.ai_ct_norm is None: QMessageBox.warning(self, "Error", "Data not ready."); return
-        if self.seed_mask is None or not np.any(self.seed_mask): QMessageBox.warning(self, "Error", "Draw seed."); return
+        if self.ai_ct_norm is None: QMessageBox.warning(self, "Error", "Load CT and PET first."); return
+        if self.seed_mask is None or not np.any(self.seed_mask[self.current_slice]):
+            QMessageBox.warning(self, "Error", "Draw a prompt on the current slice."); return
         if not self.load_selected_model(): return
-
+        progress = None
         try:
-            progress = self.create_progress("Volumetric Segmentation", "Starting Pipeline...")
-            
-            # --- PHASE 1: EXPLORATION ---
-            progress.setLabelText("Phase 1: Exploration...")
-            QApplication.processEvents()
+            progress = self.create_progress("Volumetric Segmentation", "Starting...")
 
-            z_ai = int(round(self.current_slice * self.ai_scale_info['scale_z']))
-            
-            from skimage.transform import resize
-            h, w = self.ai_ct_norm.shape[1], self.ai_ct_norm.shape[2]
-            ai_seed_2d = resize(self.seed_mask[self.current_slice], (h, w), order=0, preserve_range=True, anti_aliasing=False).astype(np.uint8)
-            
-            vol_mask_1 = self.run_volumetric_propagation_centered(z_ai, ai_seed_2d, progress, "Phase 1")
-            
-            if np.sum(vol_mask_1) == 0:
-                progress.close()
-                QMessageBox.warning(self, "Result", "Model predicted empty segmentation in Phase 1.")
-                return
-
-            # --- PHASE 2: FIND SUV MAX ---
-            progress.setLabelText("Phase 2: Finding SUV Max...")
-            QApplication.processEvents()
-            
-            suv_coords = preprocessing.find_suv_max_centroid(self.ai_pet_norm, vol_mask_1)
-            
-            if suv_coords is None:
-                final_ai_mask = vol_mask_1
-            else:
-                max_z, max_y, max_x = suv_coords
-                print(f"Global SUV Max found at AI: {suv_coords}")
-                
-                # --- PHASE 3: ROBUST PROPAGATION ---
-                progress.setLabelText("Phase 3: Robust Propagation...")
+            def report(text):
+                progress.setLabelText(text)
                 QApplication.processEvents()
 
-                new_seed_2d = preprocessing.create_local_seed_mask(
-                    self.ai_ct_norm.shape, (max_z, max_y, max_x), radius=3
-                )
-                
-                final_ai_mask = self.run_volumetric_propagation_centered(max_z, new_seed_2d, progress, "Phase 3")
-                # DEBUG: Print total pixels before cleanup
-                print(f"DEBUG: Pixels in AI mask before cleanup: {np.sum(final_ai_mask)}")
-
-            # --- PHASE 4: 3D CONNECTIVITY CLEANUP ---
-            # Remove any floating islands that might have occurred despite overlap checks
-            progress.setLabelText("Phase 4: Cleaning 3D Volume...")
-            QApplication.processEvents()
-            
-            cleaned_ai_mask = preprocessing.keep_largest_connected_component_3d(final_ai_mask)
-            #BYPASS CLEANUP
-            # cleaned_ai_mask = final_ai_mask
-
-            # --- PHASE 5: RESAMPLE ---
-            progress.setLabelText("Finalizing...")
-            QApplication.processEvents()
+            ai_mask, info = segment_volume(self.model, self.device, self.ai_ct_norm, self.ai_pet_norm,
+                                           self.ai_scale_info, self.seed_mask[self.current_slice],
+                                           self.current_slice, progress=report)
+            if not ai_mask.any():
+                progress.close()
+                if self.volumetric_mask is not None:
+                    self.volumetric_mask[:] = 0
+                    self.update_slice()
+                self.update_summary_panel()
+                QMessageBox.information(self, "Result", "No lesion segmented.\n"
+                                        "The prompt may lie on non-tumoural uptake.")
+                return
+            report("Resampling to the CT grid...")
             self.volumetric_mask = preprocessing.resample_full_mask_back_to_viewer(
-                cleaned_ai_mask, self.ai_scale_info['sitk_resampled_ref'], self.sitk_ct
-            ).astype(np.uint8)
-
+                ai_mask.astype(np.uint8), self.ai_scale_info['sitk_resampled_ref'], self.sitk_ct).astype(np.uint8)
             progress.close()
             self.update_slice()
-            QMessageBox.information(self, "Done", "Volumetric Segmentation Complete.\n(IoU Check & 3D Connectivity Applied)")
-
+            self.update_summary_panel()
         except Exception as e:
-            if 'progress' in locals(): progress.close()
+            if progress is not None: progress.close()
             import traceback; traceback.print_exc()
             QMessageBox.critical(self, "Error", f"{e}")
+
+    def mask_stats(self):
+        """Volume and SUV statistics of the volumetric mask (CT grid). None if there is no mask."""
+        if self.volumetric_mask is None or self.sitk_ct is None or not np.any(self.volumetric_mask):
+            return None
+        m = self.volumetric_mask > 0
+        vox_ml = float(np.prod(self.sitk_ct.GetSpacing())) / 1000.0
+        vol = float(m.sum() * vox_ml)
+        st = {"mtv": vol, "slices": int(m.any(axis=(1, 2)).sum())}
+        if self.pet_array is not None:
+            v = self.pet_array[m]
+            st.update({"suvmax": float(v.max()), "suvmean": float(v.mean()), "tlg": float(v.mean() * vol)})
+        return st
+
+    def mask_summary(self):
+        """Text version of mask_stats (used in the save dialog)."""
+        st = self.mask_stats()
+        if st is None:
+            return "No volumetric segmentation."
+        lines = [f"Metabolic tumour volume: {st['mtv']:.2f} mL", f"Slices: {st['slices']}"]
+        if "suvmax" in st:
+            lines += [f"SUVmax: {st['suvmax']:.2f}", f"SUVmean: {st['suvmean']:.2f}", f"TLG: {st['tlg']:.2f} g"]
+        return "\n".join(lines)
+
+    def update_summary_panel(self):
+        """Shows the statistics of the current volumetric mask in the QUANTITATIVE SUMMARY box."""
+        if not hasattr(self, "summary_values"):
+            return
+        st = self.mask_stats()
+        fmt = {"mtv": lambda x: f"{x:.2f} mL", "slices": lambda x: f"{x}", "suvmax": lambda x: f"{x:.2f}",
+               "suvmean": lambda x: f"{x:.2f}", "tlg": lambda x: f"{x:.2f} g"}
+        for key, lbl in self.summary_values.items():
+            lbl.setText(fmt[key](st[key]) if (st is not None and key in st) else "—")
+        if st is None:
+            self.lbl_summary_note.setText("Run a volumetric (3D) segmentation")
+        else:
+            self.lbl_summary_note.setText(f"Model: {self.combo_model.currentText()}")
+
+    def save_volumetric_mask(self):
+        if self.volumetric_mask is None or not np.any(self.volumetric_mask):
+            QMessageBox.warning(self, "Error", "No volumetric segmentation to save."); return
+        path, _ = QFileDialog.getSaveFileName(self, "Save mask", "lesion_mask.nii.gz", "NIfTI (*.nii.gz *.nii)")
+        if not path:
+            return
+        if not path.endswith((".nii", ".nii.gz")):
+            path += ".nii.gz"
+        img = sitk.GetImageFromArray(self.volumetric_mask.astype(np.uint8))
+        img.CopyInformation(self.sitk_ct)            # same geometry as the loaded CT
+        sitk.WriteImage(img, path)
+        QMessageBox.information(self, "Saved", f"Mask saved to:\n{path}\n\n" + self.mask_summary())
 
     # --- LOADING & UI ---
     def toggle_menu(self):
@@ -522,6 +511,7 @@ class PETCTViewer(QMainWindow):
             self.volumetric_mask = np.zeros_like(self.ct_volume, dtype=np.uint8)
             self.current_slice = self.ct_volume.shape[0]//2
             self.ai_ct_norm = None; p.close(); self.update_slice()
+            self.update_summary_panel()
 
     def load_pet_dialog(self):
         path = QFileDialog.getExistingDirectory(self, "Select PET")
@@ -546,6 +536,7 @@ class PETCTViewer(QMainWindow):
         if self.segmentation_mask is not None: self.segmentation_mask[:] = 0
         if self.volumetric_mask is not None: self.volumetric_mask[:] = 0
         self.update_slice()
+        self.update_summary_panel()
     
     def update_opacity(self, v): self.pet_opacity = v/100; self.update_slice()
     def update_seg_opacity(self, v): self.seg_opacity = v/100; self.update_slice()
