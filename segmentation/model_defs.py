@@ -1,3 +1,9 @@
+"""
+Network architectures of LesionLoop Breast.
+
+All networks take a 2.5D input of 7 channels (3 CT slices, 3 PET slices and the prompt map)
+on a 224 x 224 patch and return one channel of logits.
+"""
 import torch
 import torch.nn as nn
 
@@ -28,7 +34,7 @@ class ResBlock(nn.Module):
             nn.BatchNorm2d(out_channels),
         )
 
-        # Shortcut connection (The "Highway")
+        # Shortcut connection
         self.shortcut = nn.Identity()
         if in_channels != out_channels:
             self.shortcut = nn.Conv2d(in_channels, out_channels, 1, bias=False)
@@ -38,70 +44,11 @@ class ResBlock(nn.Module):
     def forward(self, x):
         residual = self.shortcut(x)
         out = self.conv(x)
-        out += residual   # <--- The Magic: Adding the input back to the output
+        out += residual
         return self.relu(out)
     
-#25D Unet with depth 5 (unet_1.pth)
-class UNet25D_depth5(nn.Module):
-    def __init__(self, n_channels=7, n_classes=1):
-        super().__init__()
-        
-        # --- ENCODER ---
-        self.inc = DoubleConv(n_channels, 16)       
-        self.down1 = DoubleConv(16, 32)             
-        self.down2 = DoubleConv(32, 64)             
-        self.down3 = DoubleConv(64, 128)            
-        self.down4 = DoubleConv(128, 256)           
-        self.down5 = DoubleConv(256, 512) # Bottleneck
-
-        self.dropout = nn.Dropout2d(p=0.5)
-        self.pool = nn.MaxPool2d(2)
-        
-        # --- DECODER ---
-        self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        self.up1 = DoubleConv(512 + 256, 256)
-        self.up2 = DoubleConv(256 + 128, 128)
-        self.up3 = DoubleConv(128 + 64, 64)
-        self.up4 = DoubleConv(64 + 32, 32)
-        self.up5 = DoubleConv(32 + 16, 16)
-        
-        self.outc = nn.Conv2d(16, n_classes, 1)
-
-    def forward(self, x):
-        # Down
-        x1 = self.inc(x)                # 16
-        x2 = self.down1(self.pool(x1))  # 32
-        x3 = self.down2(self.pool(x2))  # 64
-        x4 = self.down3(self.pool(x3))  # 128
-        x5 = self.down4(self.pool(x4))  # 256
-        x6 = self.down5(self.pool(x5))  # 512
-        x6 = self.dropout(x6)
-
-        # Up
-        x = self.up(x6)
-        x = torch.cat([x5, x], dim=1)
-        x = self.up1(x)
-
-        x = self.up(x)
-        x = torch.cat([x4, x], dim=1)
-        x = self.up2(x)
-
-        x = self.up(x)
-        x = torch.cat([x3, x], dim=1)
-        x = self.up3(x)
-
-        x = self.up(x)
-        x = torch.cat([x2, x], dim=1)
-        x = self.up4(x)
-        
-        x = self.up(x)
-        x = torch.cat([x1, x], dim=1)
-        x = self.up5(x)
-
-        return self.outc(x)
-    
-#25D ResUnet with depth 5 (unet_2.pth) aggressive augmentation
 class ResUNet25D_depth5(nn.Module):
+    """Residual U-Net (five levels), 2.5D input. Weights: unet_2.pth."""
     def __init__(self, n_channels=7, n_classes=1, base_filters=16):
         super().__init__()
         f = base_filters  # Starts at 16
@@ -241,12 +188,14 @@ class AttentionBlock(nn.Module):
 
 class AttentionUNet25D(nn.Module):
     """
-    Attention U-Net for 2.5D medical image segmentation
+    Attention U-Net (four levels) for 2.5D medical image segmentation
 
     Key improvements over standard U-Net:
     1. Attention gates filter skip connections
     2. Focuses on relevant features, suppresses irrelevant regions
     3. Particularly effective for small/sparse targets (tumors, lesions)
+
+    Weights: unet_3.pth.
     """
     def __init__(self, n_channels=7, n_classes=1):
         super().__init__()
@@ -317,14 +266,15 @@ class AttentionUNet25D(nn.Module):
         return self.outc(d4)
 
 class AttentionUNet25D_depth5(nn.Module):
-    #ATTENTION UNET DEPTH 5
     """
-    Attention U-Net depth 5 for 2.5D medical image segmentation
+    Attention U-Net (five levels) for 2.5D medical image segmentation
 
     Key improvements over standard U-Net:
     1. Attention gates filter skip connections
     2. Focuses on relevant features, suppresses irrelevant regions
     3. Particularly effective for small/sparse targets (tumors, lesions)
+
+    Weights: unet_4.pth.
     """
     def __init__(self, n_channels=7, n_classes=1):
         super().__init__()
@@ -346,7 +296,7 @@ class AttentionUNet25D_depth5(nn.Module):
         # --- ATTENTION GATES ---
         # F_g = gating signal (from decoder/upsample)
         # F_l = skip connection (from encoder)
-        # We need 5 gates now to match the 5 levels of skip connections
+        # One gate for each of the five skip connections
         
         # Gate for x5 (256): Upsampled 512 -> 512
         self.att1 = AttentionBlock(F_g=512, F_l=256, F_int=256)
@@ -379,7 +329,7 @@ class AttentionUNet25D_depth5(nn.Module):
         # Up 4: Input (64 + 32) -> Output 32
         self.up4 = DoubleConv(64 + 32, 32)
         
-        # Up 5 (New): Input (32 + 16) -> Output 16
+        # Up 5: Input (32 + 16) -> Output 16
         self.up5 = DoubleConv(32 + 16, 16)
 
         # --- OUTPUT ---
@@ -422,7 +372,7 @@ class AttentionUNet25D_depth5(nn.Module):
         d4 = torch.cat([x2_att, d4], dim=1)
         d4 = self.up4(d4)                   # -> 32 channels
 
-        # Level 5 (New): Upsample d4, Attend to x1
+        # Level 5: Upsample d4, Attend to x1
         d5 = self.up(d4)                    # 32 channels
         x1_att = self.att5(g=d5, x=x1)      # Attention on 16
         d5 = torch.cat([x1_att, d5], dim=1)
@@ -432,6 +382,8 @@ class AttentionUNet25D_depth5(nn.Module):
         return self.outc(d5)
 
 class MultiBranchUNet(nn.Module):
+    """Residual U-Net and five-level attention U-Net run in parallel and trained jointly;
+    the output is the mean of their logits. Weights: unet_5.pth."""
     def __init__(self, n_channels=7, n_classes=1):
         super().__init__()
         
@@ -450,44 +402,34 @@ class MultiBranchUNet(nn.Module):
         # Output shape: (Batch, n_classes, H, W) -> These are Logits
         out_att = self.branch_att(x)
         
-        # 3. Average the Logits
-        # We average here so the loss function receives a single combined prediction
+        # 3. Average the logits
         final_logits = (out_res + out_att) / 2.0
         
         return final_logits
-# --- MODEL REGISTRY ---
-# distinct mapping of filenames to classes and their specific parameters
 
+
+# --------------------------------------------------------------------------------------
+# Model registry: weight file -> architecture
+# --------------------------------------------------------------------------------------
 MODEL_REGISTRY = {
-    "unet_1.pth": {
-        #25D Unet with depth 5 (unet_1.pth)
-        "class": UNet25D_depth5,
-        "params": {"n_channels": 7, "n_classes": 1}
-    },
     "unet_2.pth": {
-        #25D ResUnet with depth 5 (unet_2.pth) aggressive augmentation/new training
+        "label": "Residual U-Net (5 levels)",
         "class": ResUNet25D_depth5,
-        "params": {"n_channels": 7, "n_classes": 1, "base_filters": 16}
+        "params": {"n_channels": 7, "n_classes": 1, "base_filters": 16},
     },
-     "unet_3.pth": {
-        #AttentionUnet depth 4 (unet_3.pth) aggressive augmentation/new training
+    "unet_3.pth": {
+        "label": "Attention U-Net (4 levels)",
         "class": AttentionUNet25D,
-        "params": {"n_channels": 7, "n_classes": 1}
+        "params": {"n_channels": 7, "n_classes": 1},
     },
-       "unet_4.pth": {
-        #AttentionUnet depth 5 (unet_4.pth) aggressive augmentation/new training
+    "unet_4.pth": {
+        "label": "Attention U-Net (5 levels)",
         "class": AttentionUNet25D_depth5,
-        "params": {"n_channels": 7, "n_classes": 1}
+        "params": {"n_channels": 7, "n_classes": 1},
     },
     "unet_5.pth": {
-        #AttentionUnet depth 5 and ResUnet depth 5 trained together as MultiBranchUNet (unet_5.pth)
+        "label": "Multi-branch network",
         "class": MultiBranchUNet,
-        "params": {"n_channels": 7, "n_classes": 1}
+        "params": {"n_channels": 7, "n_classes": 1},
     },
-}
-
-# Optional: A default fallback class if the filename isn't found
-DEFAULT_MODEL_CONFIG = {
-    "class": ResUNet25D_depth5,
-    "params": {"n_channels": 7, "n_classes": 1}
 }

@@ -1,5 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+env/
+enviroment/
+
+# IDE
+.idea/
+.vscode/
+
+# Local data and outputs
 /dataset_training
 /dataset_validation
 /dataset_generation
 /files
-/enviroment
+*.nii
+*.nii.gz
+*.dcm

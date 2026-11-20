@@ -1,6 +1,6 @@
 from PyQt5.QtWidgets import QLabel, QSizePolicy
 from PyQt5.QtCore import Qt, QRectF
-from PyQt5.QtGui import QPixmap, QImage, QPainter, QColor
+from PyQt5.QtGui import QPixmap, QImage, QPainter
 
 class AspectLabel(QLabel):
     """
@@ -91,7 +91,7 @@ class AspectLabel(QLabel):
         """Custom paint to handle zoom/pan and BLACK background."""
         painter = QPainter(self)
         
-        # --- FIX: Fill background with black first ---
+        # Fill the background with black first
         painter.fillRect(self.rect(), Qt.black)
 
         if self._pixmap is None:

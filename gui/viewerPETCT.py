@@ -1,29 +1,30 @@
-from preprocessing import preprocessing
-import sys
+"""
+LesionLoop Breast - main window.
+
+Loads a CT and a PET DICOM series, lets the operator draw a click or scribble on a breast lesion,
+runs the 2D or 3D segmentation and shows the metabolic tumour volume, SUVmax, SUVmean and TLG.
+"""
+
 import os
-import glob
 import numpy as np
 import matplotlib.pyplot as plt
 import SimpleITK as sitk
-
-# --- Deep Learning Imports ---
 import torch
-from segmentation.model_defs import MODEL_REGISTRY, DEFAULT_MODEL_CONFIG
-from segmentation.inference import (load_method, ensemble_available, segment_slice, segment_volume,
-                                    VALIDATED_ENSEMBLE_LABEL)
+
+from preprocessing import preprocessing
+from segmentation.inference import (load_method, available_models, ensemble_available, segment_slice,
+                                    segment_volume, VALIDATED_ENSEMBLE_LABEL)
 
 from PyQt5.QtWidgets import (
     QMainWindow, QLabel, QVBoxLayout, QWidget, QApplication,
-    QPushButton, QFileDialog, QSlider, QHBoxLayout, 
-    QSpinBox, QRadioButton, QButtonGroup, QGroupBox, 
-    QComboBox, QFrame, QMessageBox, QCheckBox, QSizePolicy, QProgressDialog,
+    QPushButton, QFileDialog, QSlider, QHBoxLayout,
+    QSpinBox, QRadioButton, QButtonGroup, QGroupBox,
+    QComboBox, QFrame, QMessageBox, QCheckBox, QProgressDialog,
     QGridLayout, QScrollArea
 )
-from PyQt5.QtCore import Qt, QSize, QTimer
-from PyQt5.QtGui import QImage, QPalette, QColor, QFont
+from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtGui import QImage, QPalette, QColor
 
-# Ensure this import matches your folder structure. 
-# If customQlabel.py is in the same folder, remove 'gui.'
 try:
     from gui.customQlabel import AspectLabel
 except ImportError:
@@ -50,7 +51,8 @@ class PETCTViewer(QMainWindow):
         self.model = None
         self._model_cache = {}          # loaded models, by combo entry
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.model_folder = os.path.join("segmentation", "models")
+        self.model_folder = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                         "segmentation", "models")
         
         # --- Masks ---
         self.seed_mask = None           # User Input (Red)
@@ -99,7 +101,7 @@ class PETCTViewer(QMainWindow):
         self.setPalette(p)
 
     def init_ui(self):
-        self.setWindowTitle("LesionLoop Breast ")
+        self.setWindowTitle("LesionLoop Breast")
 
         central_widget = QWidget()
         main_layout = QHBoxLayout(central_widget)
@@ -355,11 +357,10 @@ class PETCTViewer(QMainWindow):
         self.combo_model.clear()
         if not os.path.exists(self.model_folder):
             os.makedirs(self.model_folder, exist_ok=True)
-        singles = sorted(os.path.basename(m) for m in glob.glob(os.path.join(self.model_folder, "*.pth")))
         if ensemble_available(self.model_folder):
             self.combo_model.addItem(VALIDATED_ENSEMBLE_LABEL, "ensemble")
-        for m in singles:
-            self.combo_model.addItem(m, m)
+        for file_name, label in available_models(self.model_folder):
+            self.combo_model.addItem(f"{label} ({file_name})", file_name)
         if self.combo_model.count():
             self.combo_model.setEnabled(True)
             self.combo_model.setCurrentIndex(0)
@@ -581,14 +582,13 @@ class PETCTViewer(QMainWindow):
         qimg = QImage((np.clip(comb,0,1)*255).astype(np.uint8), comb.shape[1], comb.shape[0], comb.shape[1]*3, QImage.Format_RGB888)
         self.label.set_qimage(qimg)
 
-    # --- MOUSE EVENTS (FIXED) ---
+    # --- MOUSE EVENTS ---
     def wheelEvent(self, e): 
         if self.ct_volume is not None:
             self.current_slice = np.clip(self.current_slice + (1 if e.angleDelta().y() > 0 else -1), 0, self.ct_volume.shape[0]-1)
             self.update_slice()
     
     def mousePressEvent(self, e):
-        # FIX: Check explicitly for None to avoid NumPy boolean error
         if self.ct_volume is None: return 
         self.dragging = True; self.last_mouse_pos = e.pos()
         if e.button() == Qt.RightButton: self.active_action = "ZOOM"

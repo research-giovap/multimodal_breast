@@ -1,8 +1,8 @@
 """
-inference.py - The validated segmentation method, shared by the GUI.
+inference.py - The validated segmentation method of LesionLoop Breast.
 
-This module contains exactly the procedure evaluated with validate_models.py (model name suffix
-"_adap3") on the internal validation set and on the external QIN-Breast test:
+This module contains exactly the procedure evaluated in the accompanying article on the internal
+validation set and on the external QIN-Breast test:
 
   * model: soft-voting ensemble of unet_4.pth (AttentionUNet25D_depth5) and unet_5.pth
     (MultiBranchUNet); probabilities are averaged before the 0.5 threshold;
@@ -34,9 +34,9 @@ try:
 except ImportError:          # flat layout
     import preprocessing as prep
 try:
-    from segmentation.model_defs import MODEL_REGISTRY, DEFAULT_MODEL_CONFIG
+    from segmentation.model_defs import MODEL_REGISTRY
 except ImportError:
-    from model_defs import MODEL_REGISTRY, DEFAULT_MODEL_CONFIG
+    from model_defs import MODEL_REGISTRY
 
 # --------------------------------------------------------------------------------------
 # Parameters
@@ -46,7 +46,7 @@ MIN_SUPPORT = 4              # minimal 2D support (2 x 2 pixels)
 RESEED_RADIUS = 3            # radius (pixels) of the seed placed at the SUVmax
 
 VALIDATED_ENSEMBLE = ("unet_4.pth", "unet_5.pth")
-VALIDATED_ENSEMBLE_LABEL = "Ensemble unet_4 + unet_5 (validated)"
+VALIDATED_ENSEMBLE_LABEL = "Ensemble: attention U-Net + multi-branch (validated, default)"
 
 
 # --------------------------------------------------------------------------------------
@@ -69,7 +69,9 @@ class EnsembleModel(torch.nn.Module):
 
 def load_single_model(path, device):
     name = os.path.basename(path)
-    cfg = MODEL_REGISTRY.get(name, DEFAULT_MODEL_CONFIG)
+    if name not in MODEL_REGISTRY:
+        raise ValueError(f"Unknown weight file '{name}': add it to MODEL_REGISTRY in model_defs.py.")
+    cfg = MODEL_REGISTRY[name]
     model = cfg["class"](**cfg["params"])
     try:
         sd = torch.load(path, map_location=device, weights_only=True)
@@ -88,6 +90,12 @@ def load_method(model_folder, spec, device):
         members = [load_single_model(os.path.join(model_folder, f), device) for f in VALIDATED_ENSEMBLE]
         return EnsembleModel(members).to(device).eval()
     return load_single_model(os.path.join(model_folder, spec), device)
+
+
+def available_models(model_folder):
+    """Weight files of MODEL_REGISTRY present in model_folder, as (file name, label)."""
+    return [(f, cfg["label"]) for f, cfg in MODEL_REGISTRY.items()
+            if os.path.exists(os.path.join(model_folder, f))]
 
 
 def ensemble_available(model_folder):
@@ -154,7 +162,7 @@ def _cc_touching(vol, z0, ref2d):
 
 
 def propagate_adaptive(model, device, ai_ct, ai_pet, start_z, seed2d, progress=None):
-    """Bidirectional propagation with self-calibrated stopping (validate_models.py: _adap3).
+    """Bidirectional propagation with self-calibrated stopping.
     All bounds are computed on the prompt slice of the examination; see the module docstring."""
     d, h, w = ai_ct.shape
     full = np.zeros((d, h, w), np.uint8)
