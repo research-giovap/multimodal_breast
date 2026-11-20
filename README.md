@@ -148,6 +148,8 @@ If you use LesionLoop Breast, please cite the accompanying article (reference to
 
 ## Licence
 
+Copyright 2026 Consiglio Nazionale delle Ricerche (CNR) – Istituto di Bioimmagini e Sistemi Biologici Complessi (IBSBC). Lead developer: Giovanni Pasini.
+
 The code and the trained model weights are released under the [Apache License 2.0](LICENSE). See also [NOTICE](NOTICE).
 
 The segmentation and pre-processing modules (`segmentation/`, `preprocessing/`) and the weights depend only on packages with permissive licences: NumPy, SciPy, scikit-image, PyTorch (BSD), SimpleITK (Apache 2.0) and pydicom (MIT).
